@@ -1,0 +1,368 @@
+---
+title: "AllstateLoss"
+author: "Alex Wohletz & Raymond Taylor"
+date: "December 3, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+####Bugfixes
+1. Ranger/random forest section had a couple variable name issues. Corrected. 651P1272016
+
+### Base Libraries
+
+The model libraries are activated in code.
+```{r libraries, echo=FALSE}
+rm(list = ls()) #Clear out memory
+
+library(caret)
+library(caTools)
+library(doSNOW)
+library(dplyr)
+library(ggcorrplot)
+library(ggplot2)
+library(radiant)
+library(MASS)
+
+```
+###Import the data 
+
+```{r datafiles}
+setwd("C:/Users/awohl/OneDrive/MultivariateAnalysis/Final")
+MAE <-function(predictions,validation){
+  sum(abs(validation-predictions))/length(validation)}
+train <- read.csv("train.csv",header = TRUE, stringsAsFactors = TRUE)
+
+train <- train[,-1] #Remove id from train set
+
+test <- read.csv("test.csv", header = TRUE, stringsAsFactors = TRUE)
+test.id <- test$id #Keep test ID for submission
+test <- test[,-1]
+
+
+```
+###Near zero variance removal (example only, do not use!)
+
+
+### Train, validation  split
+
+Using the sample.split function, create a validation set within the training data. Please ignore the awkward naming. Some models only allow formulas whereby the target/response variable is in the train set.  We used ".r" to indicate a reserve set with target variable.
+```{r train validation}
+set.seed(101)
+#Generate the indices to split the train into train/validation
+sample <- sample.split(train, SplitRatio = .75)
+s.train.X <- subset(train, sample == TRUE)
+valid.X <- subset(train, sample == FALSE)
+valid.y <- valid.X$loss
+
+#log transform
+s.train.X[,ncol(s.train.X)]<-log(s.train.X[,ncol(s.train.X)])
+valid.X[,ncol(s.train.X)]<-log(valid.X[,ncol(valid.X)])
+s.train.y = s.train.X$loss
+
+#Some models only allow formulas so we reserve a set with the loss.
+r.train.X <- s.train.X
+r.valid.X <- valid.X
+r.train.X <- s.train.X
+r.valid.X <- valid.X
+
+hist(valid.y)
+#Remove response variable from dfs that have loss saved  
+s.train.X <-s.train.X[,-131]
+valid.X <- valid.X[,-131]
+
+#Cleanup
+rm(sample)
+```
+
+
+###Feature Extraction/Exploratory Data Analysis
+
+We did the majority of our exploratory data analysis using the radiant package as it simplifies the coding aspects and allows the analyst to easily manipulate the data free from distraction.
+```{r feature extraction}
+#Since we have a lot of unlabled continuous variables, let's check the correlation
+corr.cont <- round(cor(r.train %>% select(contains('cont'))), digits = 2)
+ggcorrplot(corr.cont, hc.order = TRUE, type = 'upper', outline.col = "white", tl.cex = 5, title = 'Continuous Correlation')
+
+#Loss visualization
+a <- ggplot(train.X, aes(train.y))
+a + geom_area(stat='bin')
+
+
+#Take a look at some of the categorical features, some of the higher numbers being the most interesting
+categorical <- r.train %>% select(contains("cat"))
+plot(categorical$cat116)
+plot(categorical$cat110)
+plot(categorical$cat113)
+
+#Visualize some of the highly correlated in relation to Loss
+a <- ggplot(r.train, aes(y = train.y, x = cont6))
+a + geom_point()
+
+a <- ggplot(r.train, aes(x = train.y, y = cont10))
+a + geom_point()
+
+```
+
+
+###Glmnet
+```{r glmnet regression }
+require(glmnet)
+
+
+#Validation set
+train.ele.x <- data.matrix(s.train.X)
+train.ele.y <- data.matrix(s.train.y)
+valid.ele <- data.matrix(valid.X)
+test.ele <- data.matrix(test)
+
+ptm<- proc.time()
+
+model.glm <- cv.glmnet(x = train.ele.x, y = train.ele.y, family = "gaussian", nfolds = 10, alpha = .10, nlambda = 1000, type.measure="mse")
+proc.time()-ptm
+
+plot(model.glm$glmnet.fit, xvar = "lambda")
+plot(model.glm)
+summary(model.glm)
+
+#Validation set error
+pred.glm <- exp(predict.cv.glmnet(model.glm,valid.ele,s = "lambda.min"))
+
+MAE(pred.glm, valid.y)
+xyplot(valid.y~pred.glm)
+
+#Cleanup
+rm(valid.ele)
+rm(train.ele.x)
+rm(train.ele.y)
+```
+
+###Random forest baseline
+
+Not a bad MAE against the validation set!  It will probably be better against the final data.
+```{r simple baseline model}
+require(ranger)
+
+model.ranger <- ranger(loss~., r.train.X, num.trees = 100, mtry = 4, importance = 'impurity', min.node.size = 5)
+pred.ranger <- predict(model.ranger, valid.X)
+pred.ranger <- exp(pred.ranger$predictions)
+#postResample(pred.ranger$predictions,test.y)
+#Error versus validation set
+MAE <- sum(abs(valid.y - pred.ranger))/length(valid.y)
+MAE #1281.74
+xyplot(valid.y~pred.ranger)
+```
+
+
+
+###Neural networks via MXNET
+MXNET provides an easy to use interface to implement a highly customized neural network.  We are going to use the LinearRegression output layer.  Testing reveals that the more iterations, the worse the MAE, so we set at 9.
+```{r neural networks MXNET}
+require(mlbench)
+require(mxnet)
+
+# A fully connected hidden layer
+
+trainx.mx <- data.matrix(s.train.X)
+valid.mx <- data.matrix(valid.X)
+test.mx <- data.matrix(test)
+
+#train.mx.x <- data.matrix(train[,-131])
+
+data <- mx.symbol.Variable("data")
+fc1 <- mx.symbol.FullyConnected(data, num_hidden=130)
+act <- mx.symbol.Activation(fc1, act_type='relu')
+fc <- mx.symbol.FullyConnected(act, num_hidden=1)
+lro <- mx.symbol.LinearRegressionOutput(fc)
+
+mx.set.seed(101)
+model.mx <- mx.model.FeedForward.create(lro, 
+                                      X=trainx.mx, y=s.train.y,
+                                      ctx=mx.cpu(), 
+                                      num.round=9, 
+                                      array.batch.size=20,
+                                      learning.rate=2e-7, momentum=0.9, 
+                                      eval.metric=mx.metric.mae)
+#Error against validation set
+pred.mx = predict(model.mx, valid.mx)
+pred.mx <- exp(t(pred.mx)) #Convert predictions into something useable
+MAE <- sum(abs(valid.y-pred.mx))/length(valid.y)
+MAE
+
+#Cleanup
+rm(trainx.mx)
+rm(valid.mx)
+```
+
+
+###H2o Deep Learning
+
+H2o is a strong learner with a built in ensembling function "H2oEnsemble".  We can use this in conjunction with level one algorithms to build an ensemble model.
+
+####Hyper parameter search
+```{r h2o hyperparam rs}
+require(h2o)
+
+localH2O = h2o.init(ip = "localhost", port = 54321, startH2O = TRUE, nthreads = -1, max_mem_size = "6G") #Set cores and mem here.
+
+#Transform the data into an h2o format.
+train_h2o <- as.h2o(r.train.X, destination_frame = "train_h2o")
+valid_h2o <- as.h2o(r.valid.X, destination_frame = "valid_h2o")
+test_h2o <- as.h2o(test)
+
+#Hyper Parameter Tuning
+hyper_params <- list(activation = c("Rectifier","Tahn","Maxout","RectifierWithDropout","TanhWithDropout","MaxoutWithDropout"),
+                     hidden = list(c(20,20),c(50,50), c(30,30,30),c(25,25,25,25)),
+                     input_dropout_ratio = c(0,0.05),
+                     l1 = seq(0,1e-4,1e-6),
+                     l2 = seq(0,1e-4,1e-6))
+#Search Criteria
+search_criteria = list(strategy="RandomDiscrete", max_runtime_secs = 3600,max_models = 100, seed = 101, stopping_rounds =5, stopping_tolerance = 1e-2)
+
+#Hyperparameter search model
+
+random_grid <- h2o.grid(algorithm = "deeplearning",grid_id = "random_grid", training_frame = train_h2o, validation_frame = valid_h2o, x = 1:130, y = 131, epochs = 3, stopping_metric = "MSE",stopping_tolerance = 1e-2, stopping_rounds =2, score_validation_samples = 1000, score_duty_cycle = 0.025, max_w2 = 10, hyper_params = hyper_params, search_criteria = search_criteria)
+
+grid <- h2o.getGrid("random_grid",sort_by = "MSE",decreasing = FALSE)
+grid
+
+#Best model
+grid@summary_table[1,]
+model.h2o.hp <- h2o.getModel(grid@model_ids[[1]])
+model.h2o.hp
+
+best_params <- model.h2o.hp@all_parameters
+
+#Save the model
+path = getwd()
+h2o.saveModel(model.h2o.hp, path = path)
+#Error against validation set.
+pred.h2o <- predict(model.h2o.hp, valid_h2o)
+pred.h2o.hp <- as.data.frame(exp(pred.h2o))
+MAE <- sum(abs(valid.y-pred.h2o.hp))/length(valid.y)
+MAE
+
+#Results not good enough? Lets keep going!
+model.h2o.hp.continued <- h2o.deeplearning(x=c(1:130), y=131, training_frame = train_h2o, validation_frame = valid_h2o,
++                                       checkpoint = best_params$model_id, l1=best_params$l1, l2=best_params$l2, epochs=100, hidden = best_params$hidden, activation = best_params$activation)
+
+
+#Error against validation with new model.
+pred.h2o <- predict(model.h2o.hp.continued, valid_h2o)
+pred.h2o.hp <- as.data.frame(exp(pred.h2o))
+MAE <- sum(abs(valid.y-pred.h2o.hp))/length(valid.y)
+MAE
+```
+
+####Basic model in h2o
+
+This is just a testing model for found params and various features. Not meant for final use.
+
+```{r baseline h2o, message= FALSE}
+#Build a baseline model
+model.h2o <- 
+  h2o.deeplearning(x = 1:130,  # column numbers for predictors
+                   y = 131,   # column number for label
+                   training_frame = train_h2o, # data in H2O format
+                   activation = "RectifierWithDropout", # or 'Tanh'
+                   input_dropout_ratio = 0.3, # % of inputs dropout
+                   hidden_dropout_ratios = c(0.5,0.5,0.5), # % for nodes dropout
+                   hidden = c(50,120,50), # three layers of 50 nodes
+                   epochs = 50,# max. no. of epochs
+                   validation_frame = valid_h2o,
+                   stopping_rounds = 2,
+                   stopping_metric = "MSE",
+                   stopping_tolerance = .01) 
+
+#Error against validation set.
+pred.h2o <- predict(model.h2o, valid_h2o)
+pred.h2o.base <- as.data.frame(exp(pred.h2o))
+MAE <- sum(abs(valid.y-pred.h2o.base))/length(valid.y)
+MAE
+
+```
+####Ensemble model
+
+```{r ensemble h2o, message=FALSE}
+#Ensemble function
+require(h2oEnsemble)
+
+family = "gaussian"
+
+##Build some learners (Add or remove as many as reasonable)
+h2o.randomForest.1 <- function(..., ntrees = 100, nbins = 50, seed = 1) 
+h2o.randomForest.wrapper(..., ntrees = ntrees, nbins = nbins, seed = seed)
+h2o.randomForest.2 <- function(..., ntrees = 250, sample_rate = 0.75, seed = 1) h2o.randomForest.wrapper(..., ntrees = ntrees, sample_rate = sample_rate, seed = seed)
+h2o.gbm.1 <- function(..., ntrees = 100, seed = 1) h2o.gbm.wrapper(..., ntrees = ntrees, seed = seed)
+h2o.gbm.2 <- function(..., ntrees = 100, nbins = 50, seed = 1) h2o.gbm.wrapper(..., ntrees = ntrees, nbins = nbins, seed = seed)
+h2o.gbm.3 <- function(..., ntrees = 100, max_depth = 10, seed = 1) h2o.gbm.wrapper(..., ntrees = ntrees, max_depth = max_depth, seed = seed)
+h2o.gbm.4 <- function(..., ntrees = 100, col_sample_rate = 0.8, seed = 1) h2o.gbm.wrapper(..., ntrees = ntrees, col_sample_rate = col_sample_rate, seed = seed)
+h2o.gbm.5 <- function(..., ntrees = 100, col_sample_rate = 0.7, seed = 1) h2o.gbm.wrapper(..., ntrees = ntrees, col_sample_rate = col_sample_rate, seed = seed)
+h2o.gbm.6 <- function(..., ntrees = 100, col_sample_rate = 0.6, seed = 1) h2o.gbm.wrapper(..., ntrees = ntrees, col_sample_rate = col_sample_rate, seed = seed)
+h2o.gbm.8 <- function(..., ntrees = 100, max_depth = 3, seed = 1) h2o.gbm.wrapper(..., ntrees = ntrees, max_depth = max_depth, seed = seed)
+h2o.deeplearning.1 <- function(..., hidden = c(30,30,30), activation = "MaxoutWithDropout", epochs = 20, seed = 1)  h2o.deeplearning.wrapper(..., hidden = hidden, activation = activation, seed = seed)
+h2o.deeplearning.2 <- function(..., hidden = c(200,200,200), activation = "Tanh", epochs = 20, seed = 1)  h2o.deeplearning.wrapper(..., hidden = hidden, activation = activation, seed = seed)
+h2o.deeplearning.3 <- function(..., hidden = c(500,500), activation = "RectifierWithDropout", epochs = 20, seed = 1)  h2o.deeplearning.wrapper(..., hidden = hidden, activation = activation, seed = seed)
+h2o.deeplearning.5 <- function(..., hidden = c(100,100,100), activation = "Rectifier", epochs = 20, seed = 1)  h2o.deeplearning.wrapper(..., hidden = hidden, activation = activation, seed = seed)
+h2o.deeplearning.6 <- function(..., hidden = c(50,50), activation = "Rectifier", epochs = 50, seed = 1)  h2o.deeplearning.wrapper(..., hidden = hidden, activation = activation, seed = seed)
+h2o.deeplearning.7 <- function(..., hidden = c(100,100), activation = "Rectifier", epochs = 50, seed = 1)  h2o.deeplearning.wrapper(..., hidden = hidden, activation = activation, seed = seed)
+
+#Assemble into the learner list
+learner <- c("h2o.randomForest.1","h2o.gbm.1","h2o.gbm.3", "h2o.deeplearning.1","h2o.deeplearning.3", "h2o.deeplearning.5")
+metalearner <- "h2o.gbm.5"
+
+model.h2o.ensemble <- h2o.ensemble(x = 1:130, y = 131, 
+                    training_frame = train_h2o, 
+                    family = family, 
+                    learner = learner, 
+                    metalearner = metalearner,
+                    cvControl = list(V = 5))
+
+#Error against validation set.
+perf <- h2o.ensemble_performance(model.h2o.ensemble, valid_h2o)
+print(perf)
+pred.h2o.ensemble <- predict(model.h2o.ensemble, valid_h2o)
+pred.h2o.ensemble.df <- as.data.frame(exp(pred.h2o.ensemble$pred))
+MAE <- sum(abs(valid.y-pred.h2o.ensemble.df)/length(valid.y))
+MAE
+
+```
+
+###Ensemble predictions
+
+We should look at the correlation amongst the predictors before choosing this method in our submission.
+```{r ensembled predictions}
+#Predict against test set
+p1 <- predict(model.h2o.ensemble, test_h2o)
+p2 <- predict(model.mx, test.mx)
+p3 <- predict(model.ranger, test)
+p4 <- predict.cv.glmnet(model.glm,test.ele,s = "lambda.min")
+p5 <- predict(model.h2o.hp.continued, test_h2o)
+
+#Do some work so all the predictions are the same format.
+p1 <- as.data.frame(p1$pred)
+p2 <- as.data.frame(t(p2))
+p3 <- as.data.frame(p3$predictions)
+p4 <- as.data.frame(p4[,1])
+p5 <- as.data.frame(p5)
+
+#Prediction dataframe
+prd.df <- data.frame(p1,p2,p3,p4,p5)
+cor.pred <- cor(prd.df)
+ggcorrplot(cor.pred)  #check correlation between predictors
+
+#Ensemble predictions using the geometric mean
+require(psych)
+ensembled <- apply(pred.df,1, geometric.mean)
+```
+##Submission!
+```{r submission code}
+#Submission
+kaggle = data.frame(id = test.id, loss = ensembled)
+colnames(kaggle) <- c("id","loss")
+write.csv(kaggle,"Allstate_submission.csv", row.names = FALSE)
+
+```
